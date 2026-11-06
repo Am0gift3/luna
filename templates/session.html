@@ -1,0 +1,196 @@
+{% extends base_template %}
+{% block content %}
+<h2>📝 Session Memory</h2>
+<meta name="csrf-token" content="{{ csrf_token() }}">
+<div class="card">
+    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:20px; flex-wrap:wrap; gap:12px;">
+        <h3 style="margin:0; display:flex; align-items:center; gap:10px;">
+            <span style="width:32px; height:32px; background:linear-gradient(135deg, var(--accent-cyan), var(--accent-purple)); border-radius:10px; display:flex; align-items:center; justify-content:center;">🧠</span>
+            Active Session State
+        </h3>
+        <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
+            <select id="serverSelect" style="width:auto; margin:0; min-width:200px;">
+                <option value="">Loading servers…</option>
+            </select>
+            <button id="refreshBtn" style="margin:0; background:rgba(6,182,212,.1); border-color:rgba(6,182,212,.2); color:var(--accent-cyan);">🔄 Refresh</button>
+        </div>
+    </div>
+    <div id="connStatus" style="margin-bottom:12px; font-size:.85rem; color:var(--text-muted);">Not connected.</div>
+    <div id="sessionData" style="background:rgba(0,0,0,.3); border:1px solid var(--border-subtle); border-radius:16px; padding:24px; white-space:pre-wrap; font-family:var(--font-mono); font-size:.85rem; color:var(--text-secondary); line-height:1.7;">
+        <div style="text-align:center; padding:40px; color:var(--text-muted);">
+            <div style="font-size:2rem; margin-bottom:12px;">⏳</div>
+            Pick a server to connect.
+        </div>
+    </div>
+</div>
+
+<script>
+    const PROXY_URL = "/mcp";
+    let messageEndpoint = null;
+    let eventSource = null;
+    let currentServer = localStorage.getItem('session_server') || '';
+    const pendingRequests = {};
+
+    const serverSelect = document.getElementById('serverSelect');
+    const connStatus   = document.getElementById('connStatus');
+
+    function setStatus(text, color) {
+        connStatus.textContent = text;
+        connStatus.style.color = color || 'var(--text-muted)';
+    }
+
+    async function loadServers() {
+        try {
+            const res = await fetchWithCSRF('/api/mcp_servers');
+            const data = await res.json();
+            const names = Object.keys(data);
+            serverSelect.innerHTML = '';
+            if (!names.length) {
+                serverSelect.innerHTML = '<option value="">No MCP servers configured</option>';
+                setStatus('No servers configured.', 'var(--accent-red)');
+                return;
+            }
+            for (const name of names) {
+                const opt = document.createElement('option');
+                opt.value = name;
+                opt.textContent = name + (data[name].connected ? ' 🟢' : ' ⚪');
+                serverSelect.appendChild(opt);
+            }
+            if (!currentServer || !names.includes(currentServer)) {
+                currentServer = names[0];
+                localStorage.setItem('session_server', currentServer);
+            }
+            serverSelect.value = currentServer;
+            connectSSE();
+        } catch (err) {
+            serverSelect.innerHTML = '<option value="">Error loading servers</option>';
+            setStatus('Failed to load servers: ' + err.message, 'var(--accent-red)');
+        }
+    }
+
+    function disconnectSSE() {
+        if (eventSource) { eventSource.close(); eventSource = null; }
+        messageEndpoint = null;
+    }
+
+    function connectSSE() {
+        disconnectSSE();
+        if (!currentServer) { setStatus('No server selected.', 'var(--accent-amber)'); return; }
+        setStatus('Connecting to ' + currentServer + '…', 'var(--text-muted)');
+        const url = PROXY_URL + '/sse?server=' + encodeURIComponent(currentServer);
+        eventSource = new EventSource(url);
+
+        eventSource.addEventListener('endpoint', (e) => {
+            messageEndpoint = e.data;
+            setStatus('Connected to ' + currentServer, 'var(--accent-green)');
+            fetchSessionState();
+        });
+
+        eventSource.addEventListener('message', (e) => {
+            try {
+                const msg = JSON.parse(e.data);
+                if (msg.id && pendingRequests[msg.id]) {
+                    pendingRequests[msg.id](msg);
+                    delete pendingRequests[msg.id];
+                }
+            } catch (_) {}
+        });
+
+        eventSource.onerror = () => {
+            setStatus('SSE error — retrying…', 'var(--accent-amber)');
+        };
+    }
+
+    serverSelect.addEventListener('change', () => {
+        currentServer = serverSelect.value;
+        localStorage.setItem('session_server', currentServer);
+        messageEndpoint = null;
+        connectSSE();
+    });
+
+    async function sendMCPRequest(method, params) {
+        if (!messageEndpoint) throw new Error('Not connected');
+        const id = Math.random().toString(36).substring(2);
+        const request = { jsonrpc: "2.0", id, method, params };
+
+        // messageEndpoint is like "/messages?session_id=abc" — attach our server param
+        const sep = messageEndpoint.includes('?') ? '&' : '?';
+        const url = PROXY_URL + messageEndpoint + sep + 'server=' + encodeURIComponent(currentServer);
+
+        const response = await fetchWithCSRF(url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(request)
+        });
+        if (!response.ok) {
+            let errorMsg = `HTTP ${response.status}`;
+            try { const j = await response.json(); errorMsg = j.error || j.detail || errorMsg; } catch (_) {}
+            throw new Error(errorMsg);
+        }
+        return new Promise((resolve, reject) => {
+            pendingRequests[id] = (msg) => {
+                if (msg.error) reject(new Error(msg.error.message));
+                else resolve(msg.result);
+            };
+            setTimeout(() => {
+                if (pendingRequests[id]) {
+                    delete pendingRequests[id];
+                    reject(new Error('Timeout (60s)'));
+                }
+            }, 60000);
+        });
+    }
+
+    async function fetchSessionState() {
+        if (!messageEndpoint) {
+            document.getElementById('sessionData').innerHTML =
+                '<div style="text-align:center; padding:40px; color:var(--text-muted);"><div style="font-size:2rem; margin-bottom:12px;">🔗</div>Waiting for endpoint…</div>';
+            return;
+        }
+        try {
+            const result = await sendMCPRequest("tools/call", { name: "get_session_state", arguments: {} });
+            const data = result || {};
+            const commands = data.executed_commands || [];
+            const count = commands.length;
+            const phase = data.current_phase || 'N/A';
+            const sessionId = data.session_id || 'N/A';
+
+            let html = `<div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(200px,1fr)); gap:16px; margin-bottom:24px;">`;
+            html += `<div style="padding:16px; background:rgba(6,182,212,.05); border:1px solid rgba(6,182,212,.15); border-radius:12px;">
+                <div style="font-size:.7rem; text-transform:uppercase; letter-spacing:.1em; color:var(--text-muted); margin-bottom:4px;">Session ID</div>
+                <div style="color:var(--accent-cyan); font-weight:600;">${sessionId}</div></div>`;
+            html += `<div style="padding:16px; background:rgba(139,92,246,.05); border:1px solid rgba(139,92,246,.15); border-radius:12px;">
+                <div style="font-size:.7rem; text-transform:uppercase; letter-spacing:.1em; color:var(--text-muted); margin-bottom:4px;">Current Phase</div>
+                <div style="color:var(--accent-purple); font-weight:600;">${phase}</div></div>`;
+            html += `<div style="padding:16px; background:rgba(16,185,129,.05); border:1px solid rgba(16,185,129,.15); border-radius:12px;">
+                <div style="font-size:.7rem; text-transform:uppercase; letter-spacing:.1em; color:var(--text-muted); margin-bottom:4px;">Commands Executed</div>
+                <div style="color:var(--accent-green); font-weight:600; font-size:1.25rem;">${count}</div></div></div>`;
+
+            if (commands.length > 0) {
+                html += `<div style="margin-bottom:16px;"><div style="font-size:.8rem; text-transform:uppercase; letter-spacing:.1em; color:var(--text-muted); margin-bottom:12px; font-weight:600;">Recent Commands</div>`;
+                commands.slice(-5).forEach((cmd, i) => {
+                    const cmdStr = (cmd.command || '').substring(0, 60);
+                    html += `<div style="padding:10px 14px; background:rgba(0,0,0,.2); border-radius:8px; margin-bottom:6px; border-left:3px solid var(--accent-cyan);">
+                        <span style="color:var(--accent-cyan); font-weight:600; font-size:.8rem;">#${count - Math.min(5, commands.length) + i + 1}</span>
+                        <span style="color:var(--text-secondary); margin-left:8px;">${cmd.tool}:</span>
+                        <code style="margin-left:8px; font-size:.75rem;">${cmdStr}${(cmd.command || '').length > 60 ? '…' : ''}</code></div>`;
+                });
+                html += `</div>`;
+            } else {
+                html += `<div style="text-align:center; padding:20px; color:var(--text-muted);">No commands executed yet.</div>`;
+            }
+
+            html += `<details style="margin-top:20px;"><summary style="font-weight:600; color:var(--accent-cyan); cursor:pointer; font-size:.9rem;">Full Details (JSON)</summary>
+                <pre style="margin-top:12px; font-size:.75rem; max-height:400px; overflow:auto;">${JSON.stringify(data, null, 2)}</pre></details>`;
+
+            document.getElementById('sessionData').innerHTML = html;
+        } catch (err) {
+            document.getElementById('sessionData').innerHTML =
+                `<div style="color:var(--accent-red); text-align:center; padding:40px;">❌ Error: ${err.message}</div>`;
+        }
+    }
+
+    document.getElementById('refreshBtn').onclick = fetchSessionState;
+    document.addEventListener('DOMContentLoaded', loadServers);
+</script>
+{% endblock %}

@@ -1,0 +1,23 @@
+{
+  "kaggle": {
+    "name": "Kaggle (ruth)",
+    "type": "openai",
+    "url": "https://martha-princesslike-gerardo.ngrok-free.dev",
+    "api_key": "xQp_4t1Qu-ggvJjoi8CDWmbADrGT6IKQaKY8gdI0vHo",
+    "enabled": false
+  },
+  "ollama": {
+    "name": "Ollama (local)",
+    "type": "ollama",
+    "url": "http://localhost:11434",
+    "api_key": "",
+    "enabled": false
+  },
+  "orca": {
+    "name": "ORCA",
+    "type": "openai",
+    "url": "https://martha-princesslike-gerardo.ngrok-free.dev",
+    "api_key": "3fEdMt_HfeZsV-8FGgBnXI2ueyR4H7QXKTMg-ICQ0Nc",
+    "enabled": true
+  }
+}
